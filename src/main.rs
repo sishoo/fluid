@@ -6,6 +6,7 @@ use std::ffi::CStr;
 use std::io::Cursor;
 use std::mem;
 use std::mem::align_of;
+use std::mem::size_of;
 
 mod lib;
 use lib::{find_memory_type_index, compile_glsl_to_spirv, record_submit_commandbuffer, Base};
@@ -19,10 +20,9 @@ THINGS TO DO:
 
 use a compute shader for the fluid calculations
 
-
-set the vertex buffer to a default value.
-
-Each cell can be a quad
+handle the 2d array confusion.
+using an image makes sense for the 2d part but if we want to implement dynamic details it would be wierd
+maybe flatted out the 2d buffer into a 1d one then take chunks from it with the size of the cell_resolution
 
 
  */
@@ -33,7 +33,10 @@ Each cell can be a quad
 // const WINDOW_WIDTH: u32 = 800;
 // const WINDOW_HEIGHT: u32 = 600;
 const WINDOW_SIZE_PIXELS: u32 = 1000;
-const CELL_SIZE_PIXELS: usize = 50; // making smaller cells means more accurate but more laggy and vice versa
+// const CELL_SIZE_PIXELS: usize = 50; // making smaller cells means more accurate but more laggy and vice versa
+const CELL_RESOLUTION: usize = 128; // more cells = more accurate = more lag and vice versa
+const NUM_CELLS: usize = CELL_RESOLUTION * CELL_RESOLUTION;
+
 
 #[macro_export]
 macro_rules! offset_of {
@@ -46,9 +49,74 @@ macro_rules! offset_of {
 }
 
 fn main() {
-    let num_cells = WINDOW_SIZE_PIXELS as usize / CELL_SIZE_PIXELS;
+    // the fluid description buffer is a buffer that contains both the
+    // pressure values and the vector field
+    // apparently its best practice to allocate one buffer, and assign different ranges of that buffer to
+    // data if the data is commonly used together
+    let fluid_description_buffer_size_bytes = (NUM_CELLS * (size_of::<Vec2>() + size_of::<f32>())) as u64;
 
+    let fluid_description_buffer_create_info = vk::BufferCreateInfo {
+        size: fluid_description_buffer_size_bytes,
+        usage: vk::BufferUsageFlags::STORAGE | vk::BufferUsageFlags::TRANSFER,
+        sharing_mode: vk::SharingMode::CONCURRENT
+    };
 
+    let fluid_description_buffer = base
+        .device
+        .create_buffer(&vector_field_create_info, None)
+        .unwrap();
+
+    let fluid_description_buffer_memory_reqs = base
+        .device
+        .get_buffer_memory_requirements(fluid_description_buffer);
+
+    let fluid_description_buffer_memory_type_index = get_memory_type_index(
+        &fluid_description_buffer_memory_reqs,
+        &base.device_memory_properties,
+        vk::MemoryPropertyFlags::HOST_VISIBLE || vk::MemoryPropertyFlags::HOST_COHERENT
+    );
+
+    let fluid_description_buffer_allocate_info = vk::MemoryAllocateInfo {
+        allocation_size: fluid_description_buffer_memory_reqs.size,
+        memory_type_index: fluid_description_buffer_memory_type_index
+    };
+
+    let fluid_description_buffer_memory = base
+        .device
+        .allocate_buffer(&fluid_description_buffer_allocate_info, None)
+        .unwrap();
+
+    let vector_field_default_data = [[Vec2::new(0.0, 0.0); CELL_RESOLUTION]; CELL_RESOLUTION];
+    let vector_field_size_bytes = NUM_CELLS * size_of::<Vec2>();
+
+    let pressure_map_default_data = [[0.0; CELL_RESOLUTION]; CELL_RESOLUTION];
+    let pressure_map_size_bytes = NUM_CELLS * size_of::<f32>();
+
+    let mut mapped_fluid_description_buffer_ptr = base
+        .device
+        .map_memory(
+            fluid_description_buffer_memory,
+            0,
+            fluid_description_buffer_memory_reqs.size,
+            vk::MemoryMapFlags::empty(),
+        )
+        .unwrap();
+
+    unsafe {
+        // first copy the vector field in
+        std::ptr::copy_nonoverlapping(
+            vector_field_default_data.as_ptr(),
+            mapped_fluid_description_buffer_ptr as *mut Vec2,
+            vector_field_default_data.len()
+        );
+        mapped_fluid_description_buffer_ptr += vector_field_default_data.len();
+        // then the pressure map
+        std::ptr::copy_nonoverlapping(
+            pressure_map_default_data.as_ptr(),
+            mapped_fluid_description_buffer_ptr as *mut f32,
+            pressure_map_default_data.len()
+        );
+    }
 
     unsafe {
         let base = Base::new(WINDOW_SIZE_PIXELS, WINDOW_SIZE_PIXELS, "fluid beast");
@@ -56,7 +124,7 @@ fn main() {
         // we have to make a an array of attachments for the renderpass then get reference object things
         // for each attachment in the array
         let renderpass_attachments = [
-            // this is the color attachment (stores color )
+            // this is the color attachment (stores color)
             vk::AttachmentDescription {
                 format: base.surface_format.format,
                 samples: vk::SampleCountFlags::TYPE_1, // one sample per pixel
